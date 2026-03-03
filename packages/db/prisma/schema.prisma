@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PickStatus {
+  OPEN
+  WON
+  LOST
+  PUSH
+  VOID
+}
+
+model Pick {
+  id                String        @id @default(cuid())
+  sport             String
+  league            String
+  event             String
+  marketType        String
+  selection         String
+  stakeUnits        Decimal       @db.Decimal(10, 2)
+  postedOdds        Int
+  fairProbability   Decimal       @db.Decimal(7, 6)
+  expectedValue     Decimal       @db.Decimal(8, 6)
+  rationale         String
+  discordMessageId  String?
+  publicSlug        String        @unique
+  status            PickStatus    @default(OPEN)
+  resultOddsClose   Int?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  oddsSnapshots OddsSnapshot[]
+}
+
+model Sportsbook {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  createdAt DateTime @default(now())
+
+  odds OddsSnapshot[]
+}
+
+model OddsSnapshot {
+  id          String     @id @default(cuid())
+  pickId      String
+  sportsbookId String
+  odds        Int
+  capturedAt  DateTime   @default(now())
+
+  pick       Pick       @relation(fields: [pickId], references: [id], onDelete: Cascade)
+  sportsbook Sportsbook @relation(fields: [sportsbookId], references: [id], onDelete: Cascade)
+
+  @@index([pickId, capturedAt])
+}
