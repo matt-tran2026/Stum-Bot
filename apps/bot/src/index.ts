@@ -8,6 +8,7 @@ import {
   EmbedBuilder,
   PermissionFlagsBits
 } from "discord.js";
+import { scrapeBetFromLink } from "./lib/scrapers.js";
 
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
@@ -17,6 +18,9 @@ const freePicksChannelId = process.env.DISCORD_FREE_PICKS_CHANNEL_ID;
 const premiumPicksChannelId = process.env.DISCORD_PREMIUM_PICKS_CHANNEL_ID;
 const helpChannelId = process.env.DISCORD_HELP_CHANNEL_ID;
 const supportRoleId = process.env.DISCORD_SUPPORT_ROLE_ID;
+const apiBaseUrl = process.env.API_BASE_URL ?? "http://localhost:4000";
+const enableScrapers = (process.env.ENABLE_SCRAPERS ?? "true").toLowerCase() === "true";
+const scraperTimeoutMs = Number(process.env.SCRAPER_TIMEOUT_MS ?? 15000);
 
 if (!token || !clientId || !guildId) {
   throw new Error("Missing DISCORD_TOKEN, DISCORD_CLIENT_ID, or DISCORD_GUILD_ID");
@@ -34,7 +38,7 @@ const commands = [
     .setDescription("Find where free picks, premium picks, and support are."),
   new SlashCommandBuilder()
     .setName("post-template")
-    .setDescription("Admin-only: post a pick template to free or premium picks.")
+    .setDescription("Admin-only: post a pick to free or premium picks from a bet link.")
     .addStringOption((opt) =>
       opt
         .setName("tier")
@@ -47,57 +51,9 @@ const commands = [
     )
     .addStringOption((opt) =>
       opt
-        .setName("headline")
-        .setDescription("Optional title for this pick post")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("market")
-        .setDescription("Example: Player Props - Threes")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("selection")
-        .setDescription("Example: Curry Over 4.5 Threes")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("odds")
-        .setDescription("Example: +105")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("stake_units")
-        .setDescription("Example: 1.5u")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("fanduel_odds")
-        .setDescription("Example: +100")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("draftkings_odds")
-        .setDescription("Example: -105")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
-        .setName("caesars_odds")
-        .setDescription("Example: +102")
-        .setRequired(false)
-    )
-    .addStringOption((opt) =>
-      opt
         .setName("bet_link")
-        .setDescription("Link to the bet slip or sportsbook page")
-        .setRequired(false)
+        .setDescription("Bet link with query params for sport/market/selection/event")
+        .setRequired(true)
     )
 ];
 
@@ -107,8 +63,260 @@ await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
 });
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
+
+type BetLinkPayload = {
+  sport: string;
+  market: string;
+  selection: string;
+  event?: string;
+  eventId?: string;
+  sportsbook?: string;
+  postedOdds?: number;
+};
+
+type OddsCompareResponse = {
+  eventName: string;
+  sport: string;
+  market: string;
+  selection: string;
+  sportsbook: string | null;
+  postedOdds: number | null;
+  books: Array<{
+    bookKey: string;
+    bookName: string;
+    odds: number;
+  }>;
+};
+
+function normalizeBookFromHostname(hostname: string): string | undefined {
+  const host = hostname.toLowerCase();
+  if (host.includes("bet365")) return "Bet365";
+  if (host.includes("fanduel")) return "FanDuel";
+  if (host.includes("draftkings")) return "DraftKings";
+  if (host.includes("caesars")) return "Caesars";
+  if (host.includes("betmgm")) return "BetMGM";
+  return undefined;
+}
+
+function parseBetLink(link: string): BetLinkPayload | null {
+  let url: URL;
+  try {
+    url = new URL(link);
+  } catch {
+    return null;
+  }
+
+  const sport =
+    url.searchParams.get("sport") ??
+    url.searchParams.get("sport_key") ??
+    url.searchParams.get("league");
+
+  const market =
+    url.searchParams.get("market") ??
+    url.searchParams.get("market_key") ??
+    url.searchParams.get("bet_type");
+
+  const selection =
+    url.searchParams.get("selection") ??
+    url.searchParams.get("pick") ??
+    url.searchParams.get("outcome");
+
+  const eventId =
+    url.searchParams.get("event_id") ??
+    url.searchParams.get("eventId");
+
+  const event =
+    url.searchParams.get("event") ??
+    url.searchParams.get("event_name");
+
+  const sportsbook =
+    url.searchParams.get("sportsbook") ??
+    url.searchParams.get("book") ??
+    url.searchParams.get("bookmaker") ??
+    normalizeBookFromHostname(url.hostname);
+
+  const postedOddsRaw = url.searchParams.get("odds") ?? url.searchParams.get("price");
+  const postedOdds = postedOddsRaw ? Number(postedOddsRaw) : undefined;
+
+  if (!sport || !market || !selection || (!eventId && !event)) {
+    return null;
+  }
+
+  return {
+    sport,
+    market,
+    selection,
+    event: event ?? undefined,
+    eventId: eventId ?? undefined,
+    sportsbook,
+    postedOdds: Number.isFinite(postedOdds) ? postedOdds : undefined
+  };
+}
+
+function parseManualBetDetails(input: string): Partial<BetLinkPayload> {
+  const fields: Partial<BetLinkPayload> = {};
+  const regex = /(sport|market|selection|event|event_id|eventid|sportsbook|book|bookmaker|odds|price)\s*[:=]\s*([^|\n]+)/gi;
+
+  for (const match of input.matchAll(regex)) {
+    const key = match[1].toLowerCase().trim();
+    const rawValue = match[2].trim();
+    if (!rawValue) continue;
+
+    if (key === "sport") fields.sport = rawValue;
+    if (key === "market") fields.market = rawValue;
+    if (key === "selection") fields.selection = rawValue;
+    if (key === "event") fields.event = rawValue;
+    if (key === "event_id" || key === "eventid") fields.eventId = rawValue;
+    if (key === "sportsbook" || key === "book" || key === "bookmaker") fields.sportsbook = rawValue;
+    if (key === "odds" || key === "price") {
+      const oddsNum = Number(rawValue);
+      if (Number.isFinite(oddsNum)) fields.postedOdds = oddsNum;
+    }
+  }
+
+  return fields;
+}
+
+function mergeBetDetails(base: BetLinkPayload | null, extras: Partial<BetLinkPayload>): BetLinkPayload | null {
+  const sport = extras.sport ?? base?.sport;
+  const market = extras.market ?? base?.market;
+  const selection = extras.selection ?? base?.selection;
+  const event = extras.event ?? base?.event;
+  const eventId = extras.eventId ?? base?.eventId;
+
+  if (!sport || !market || !selection || (!event && !eventId)) {
+    return null;
+  }
+
+  return {
+    sport,
+    market,
+    selection,
+    event,
+    eventId,
+    sportsbook: extras.sportsbook ?? base?.sportsbook,
+    postedOdds: extras.postedOdds ?? base?.postedOdds
+  };
+}
+
+function extractFirstUrl(input: string): string | null {
+  const match = input.match(/https?:\/\/\S+/i);
+  return match ? match[0] : null;
+}
+
+async function parseBetLinkWithRedirect(rawInput: string): Promise<BetLinkPayload | null> {
+  const extractedUrl = extractFirstUrl(rawInput);
+  const link = extractedUrl ?? rawInput.trim();
+  const direct = parseBetLink(link);
+  const manual = parseManualBetDetails(rawInput);
+
+  if (direct) {
+    return mergeBetDetails(direct, manual);
+  }
+
+  if (!extractedUrl) {
+    return mergeBetDetails(null, manual);
+  }
+
+  let url: URL;
+  try {
+    url = new URL(link);
+  } catch {
+    return mergeBetDetails(null, manual);
+  }
+
+  // Some sportsbooks share short links (ex: bet365 /s/r/...) that redirect to a fuller URL.
+  if (!url.hostname.toLowerCase().includes("bet365")) {
+    return mergeBetDetails(null, manual);
+  }
+
+  try {
+    const response = await fetch(link, {
+      method: "GET",
+      redirect: "follow"
+    });
+
+    const redirected = response.url && response.url !== link ? parseBetLink(response.url) : null;
+    return mergeBetDetails(redirected, manual);
+  } catch {
+    return mergeBetDetails(null, manual);
+  }
+}
+
+async function parseAnyBetPayload(input: string): Promise<BetLinkPayload | null> {
+  const direct = await parseBetLinkWithRedirect(input);
+  if (direct) {
+    return direct;
+  }
+
+  const fragments = input.split("|").map((part) => part.trim()).filter(Boolean);
+  for (const fragment of fragments) {
+    const parsed = await parseBetLinkWithRedirect(fragment);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  if (enableScrapers) {
+    const link = extractFirstUrl(input);
+    if (link) {
+      const scraped = await scrapeBetFromLink(link, { timeoutMs: scraperTimeoutMs });
+      if (scraped) {
+        return mergeBetDetails(null, scraped);
+      }
+    }
+  }
+
+  return null;
+}
+
+function formatOdds(odds: number): string {
+  return odds > 0 ? `+${odds}` : `${odds}`;
+}
+
+async function compareBetLinkOdds(payload: BetLinkPayload): Promise<OddsCompareResponse> {
+  const response = await fetch(`${apiBaseUrl}/odds/compare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Odds comparison failed: ${body}`);
+  }
+
+  return response.json() as Promise<OddsCompareResponse>;
+}
+
+function renderOddsComparison(comparison: OddsCompareResponse): string {
+  const sortedBooks = [...comparison.books].sort((a, b) => b.odds - a.odds);
+  const topBooks = sortedBooks.slice(0, 6);
+
+  const postedLine = comparison.sportsbook || comparison.postedOdds !== null
+    ? `Posted: ${comparison.selection} | ${comparison.postedOdds !== null ? formatOdds(comparison.postedOdds) : "n/a"} @ ${comparison.sportsbook ?? "unknown book"}`
+    : `Selection: ${comparison.selection}`;
+
+  const marketLines = topBooks.map((book) => `- ${book.bookName}: ${formatOdds(book.odds)}`);
+
+  return [
+    `**Bet odds check**`,
+    `Event: ${comparison.eventName}`,
+    postedLine,
+    "",
+    "**Other books:**",
+    ...marketLines,
+    "",
+    "**Risk note:** Bet responsibly. No bet is guaranteed."
+  ].join("\n");
+}
 
 function channelMention(channelId: string | undefined, fallback: string): string {
   return channelId ? `<#${channelId}>` : fallback;
@@ -189,16 +397,23 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const tier = interaction.options.getString("tier", true);
-    const headline = interaction.options.getString("headline") ?? "New Pick";
-    const market = interaction.options.getString("market") ?? "[fill]";
-    const selection = interaction.options.getString("selection") ?? "[fill]";
-    const odds = interaction.options.getString("odds") ?? "[fill]";
-    const stakeUnits = interaction.options.getString("stake_units") ?? "[fill]";
-    const fanduelOdds = interaction.options.getString("fanduel_odds") ?? "[fill]";
-    const draftkingsOdds = interaction.options.getString("draftkings_odds") ?? "[fill]";
-    const caesarsOdds = interaction.options.getString("caesars_odds") ?? "[fill]";
-    const betLink = interaction.options.getString("bet_link") ?? "[fill]";
+    const betLink = interaction.options.getString("bet_link", true);
     const targetChannelId = tier === "premium" ? premiumPicksChannelId : freePicksChannelId;
+    const payload = await parseAnyBetPayload(betLink);
+
+    if (!payload) {
+      await interaction.editReply({
+        content: [
+          "I couldn't extract bet details from that link.",
+          "Required fields are: `sport`, `market`, `selection`, and either `event` or `event_id`.",
+          "Short/private sportsbook links often hide this data unless they redirect to a public URL with those params.",
+          `Scraper fallback for bet365/hardrock is ${enableScrapers ? "enabled" : "disabled"} but may still fail on protected links.`,
+          "Fallback format in the same `bet_link` field:",
+          "`https://... | sport=basketball_nba | market=player_points | selection=Bruce Brown Under 7.5 | event=Denver Nuggets vs Los Angeles Lakers | odds=-100 | sportsbook=bet365`"
+        ].join("\n")
+      });
+      return;
+    }
 
     if (!targetChannelId || !interaction.guild) {
       await interaction.editReply({
@@ -222,22 +437,21 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    const template = [
-      `## ${headline}`,
-      "",
-      `**Market:** ${market}`,
-      `**Selection:** ${selection}`,
-      `**Odds:** ${odds}`,
-      `**Stake (units):** ${stakeUnits}`,
-      `**Bet Link:** ${betLink}`,
-      "",
-      "**Market check (other books):**",
-      `- FanDuel: ${fanduelOdds}`,
-      `- DraftKings: ${draftkingsOdds}`,
-      `- Caesars: ${caesarsOdds}`,
-      "",
-      "**Risk note:** Bet responsibly. No bet is guaranteed."
-    ].join("\n");
+    let template: string;
+    try {
+      const comparison = await compareBetLinkOdds(payload);
+      template = [
+        renderOddsComparison(comparison),
+        "",
+        `Bet Link: ${betLink}`
+      ].join("\n");
+    } catch (error) {
+      console.error("Failed to compare odds for /post-template:", error);
+      await interaction.editReply({
+        content: "Failed to compare odds for this bet link. Verify the link params and API key, then try again."
+      });
+      return;
+    }
 
     const me = interaction.guild.members.me;
     const perms = me?.permissionsIn(targetChannel);
@@ -282,6 +496,43 @@ client.on("guildMemberAdd", async (member) => {
     await channel.send(welcomeText);
   } catch (error) {
     console.error("Failed to send welcome message:", error);
+  }
+});
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) {
+    return;
+  }
+
+  const links = message.content.match(/https?:\/\/\S+/gi);
+  if (!links?.length) {
+    return;
+  }
+
+  let betPayload: BetLinkPayload | null = null;
+  for (const link of links) {
+    betPayload = await parseAnyBetPayload(link);
+    if (betPayload) {
+      break;
+    }
+  }
+
+  if (!betPayload) {
+    return;
+  }
+
+  try {
+    const comparison = await compareBetLinkOdds(betPayload);
+    await message.reply(renderOddsComparison(comparison));
+  } catch (error) {
+    console.error("Failed to compare odds from message link:", error);
+    await message.reply([
+      "I found a bet link, but couldn't compare it.",
+      "I need extractable params like:",
+      "`sport`, `market`, `selection`, and either `event` or `event_id`.",
+      "Example: `...?sport=basketball_nba&market=player_points&selection=Bruce%20Brown%20Under%207.5&event=Denver%20Nuggets%20vs%20Lakers&odds=-100&sportsbook=bet365`",
+      "If you're using a short sportsbook link, try the fully expanded share URL."
+    ].join("\n"));
   }
 });
 

@@ -37,5 +37,8 @@ MVP monorepo for running a sports picks Discord server with onboarding helpers a
 
 ## Notes
 
-- This scaffold uses placeholder odds ingestion. Wire `fetchMarketOdds` to your odds provider.
+- Bot auto-comparison from chat links is supported via `POST /odds/compare` and The Odds API.
+- Link parsing expects query params: `sport`, `market`, `selection`, and either `event` or `event_id`.
+- Example link format: `https://your-link?sport=basketball_nba&market=player_points&selection=Bruce%20Brown%20Under%207.5&event=Denver%20Nuggets%20vs%20Lakers&odds=-100&sportsbook=bet365`
+- Best-effort scraper fallback exists for `bet365` and `hardrock` links (`ENABLE_SCRAPERS=true`), but protected/private links may still fail.
 - Add legal/compliance text and responsible gambling disclaimers before production usage.

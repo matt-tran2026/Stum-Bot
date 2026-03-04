@@ -4,7 +4,7 @@ import cors from "cors";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { expectedValuePerUnit, formatPercent } from "@mvp/shared";
-import { fetchMarketOdds, buildOddsComparison } from "./lib/odds.js";
+import { compareOdds, fetchMarketOdds, buildOddsComparison } from "./lib/odds.js";
 
 const app = express();
 app.use(cors());
@@ -21,6 +21,18 @@ const createPickSchema = z.object({
   fairProbability: z.number().min(0.01).max(0.99)
 });
 
+const compareOddsSchema = z.object({
+  sport: z.string().min(1),
+  market: z.string().min(1),
+  selection: z.string().min(1),
+  event: z.string().min(1).optional(),
+  eventId: z.string().min(1).optional(),
+  sportsbook: z.string().min(1).optional(),
+  postedOdds: z.number().int().optional()
+}).refine((val) => Boolean(val.event || val.eventId), {
+  message: "Either event or eventId is required"
+});
+
 type InMemoryPick = z.infer<typeof createPickSchema> & {
   id: string;
   postedOdds: number;
@@ -33,6 +45,21 @@ const picks = new Map<string, InMemoryPick>();
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "api", now: new Date().toISOString() });
+});
+
+app.post("/odds/compare", async (req, res) => {
+  const parsed = compareOddsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() });
+  }
+
+  try {
+    const result = await compareOdds(parsed.data);
+    return res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to compare odds";
+    return res.status(400).json({ error: message });
+  }
 });
 
 app.post("/picks", async (req, res) => {
